@@ -11,7 +11,7 @@ A repository to consolidate stable diffusion finetuning scripts. Train inpaintin
  - Use xformers for more memory efficient training
 
 # Contributing
-Pull requests, discussions, requests, suggestions, and critiques are all welcome!
+Pull requests, discussions, requests, suggestions, and critiques are all welcome! :)
 
 # Disclaimer
 This is a combination of a bunch of repos as well as my own code and edits on scripts. I will do my best to give credit where credit is due in the form of comments, licenses, a shout-out on the readme, etc. If I happen to miss giving anyone credit/include a license please email me at labounty3d@gmail.com and I will fix it!
