@@ -9,6 +9,9 @@ A repository to consolidate stable diffusion finetuning scripts in to a training
  - Use filenames as prompts
  - Use bnb 8-bit adam for more memory efficient training
  - Use xformers for more memory efficient training
+ - Mixed precision (fp16/bf16) training
+ - Prompt shuffling (split on ',' or a custom string and shuffle based on a given probability)
+ - Train depth with custom depth images
 
 # Contributing
 Pull requests, discussions, requests, suggestions, and critiques are all welcome! :)
