@@ -21,13 +21,13 @@
 
     -mask_scale_max | The probability of randomizing the instance prompt.
 
-    -mask_dropout_prob | The probability of randomizing the using a blank mask.
+    -mask_dropout_prob | The probability of using a blank mask.
 
     -class_mask_scale_min | The probability of randomizing the instance prompt for the class images.
 
     -class_mask_scale_max | The probability of randomizing the instance prompt for the class images.
 
-    -class_mask_dropout_prob | The probability of randomizing the using a blank mask for the class images.
+    -class_mask_dropout_prob | The probability of using a blank mask for the class images.
 
     -instance_prompt_sep_token | The seperator to use to randomize the substrings in the instance prompt.
 

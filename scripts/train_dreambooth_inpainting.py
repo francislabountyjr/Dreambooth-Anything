@@ -150,7 +150,7 @@ def parse_args():
         "--mask_dropout_prob",
         default=0.25,
         type=float,
-        help="The probability of randomizing the using a blank mask."
+        help="The probability of using a blank mask."
     )
     parser.add_argument(
         "--class_mask_scale_min",
@@ -168,7 +168,7 @@ def parse_args():
         "--class_mask_dropout_prob",
         default=0.25,
         type=float,
-        help="The probability of randomizing the using a blank mask for the class images."
+        help="The probability of using a blank mask for the class images."
     )
     parser.add_argument(
         "--instance_prompt_sep_token",
