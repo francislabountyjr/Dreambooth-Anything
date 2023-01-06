@@ -97,4 +97,4 @@
 
     -prefetch_factor | Number of batches to prefetch.
 
-    -drop_incomplete_batches | Whether or not to drop incomplete batches.
+    -drop_incomplete_batches | Whether or not to drop incomplete batches. (May help stabilize gradient)

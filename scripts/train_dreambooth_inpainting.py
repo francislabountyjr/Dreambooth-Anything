@@ -1,14 +1,14 @@
 import argparse
-import contextlib
 import hashlib
 import itertools
 import math
 import os
 import re
 import random
-import warnings
 from pathlib import Path
 from typing import Optional
+
+import numpy as np
 import torch
 import torch.nn.functional as F
 import torch.utils.checkpoint
@@ -17,15 +17,21 @@ from torch.utils.data import Dataset
 from accelerate import Accelerator
 from accelerate.logging import get_logger
 from accelerate.utils import set_seed
-from diffusers import AutoencoderKL, DDPMScheduler, StableDiffusionPipeline, UNet2DConditionModel
+from diffusers import (
+    AutoencoderKL,
+    DDPMScheduler,
+    StableDiffusionInpaintPipeline,
+    StableDiffusionPipeline,
+    UNet2DConditionModel,
+)
 from diffusers.optimization import get_scheduler
 from diffusers.utils import check_min_version
 from diffusers.utils.import_utils import is_xformers_available
 from huggingface_hub import HfFolder, Repository, whoami
-from PIL import Image
+from PIL import Image, ImageDraw, ImageChops
 from torchvision import transforms
 from tqdm.auto import tqdm
-from transformers import AutoTokenizer, PretrainedConfig
+from transformers import CLIPTextModel, CLIPTokenizer
 
 
 # Will error if the minimal version of diffusers is not installed. Remove at your own risks.
@@ -34,27 +40,59 @@ check_min_version("0.10.0.dev0")
 logger = get_logger(__name__)
 
 
-def import_model_class_from_model_name_or_path(pretrained_model_name_or_path: str, revision: str):
-    text_encoder_config = PretrainedConfig.from_pretrained(
-        pretrained_model_name_or_path,
-        subfolder="text_encoder",
-        revision=revision,
-    )
-    model_class = text_encoder_config.architectures[0]
+def prepare_mask_and_masked_image(image, mask, discretize=True):
+    image = np.array(image.convert("RGB"))
+    image = image[None].transpose(0, 3, 1, 2)
+    image = torch.from_numpy(image).to(dtype=torch.float32) / 127.5 - 1.0
 
-    if model_class == "CLIPTextModel":
-        from transformers import CLIPTextModel
-
-        return CLIPTextModel
-    elif model_class == "RobertaSeriesModelWithTransformation":
-        from diffusers.pipelines.alt_diffusion.modeling_roberta_series import RobertaSeriesModelWithTransformation
-
-        return RobertaSeriesModelWithTransformation
+    mask = np.array(mask.convert("L"))
+    mask = mask.astype(np.float32) / 255.0
+    mask = mask[None, None]
+    if discretize:
+        mask[mask < 0.5] = 0
+        mask[mask >= 0.5] = 1
     else:
-        raise ValueError(f"{model_class} is not supported.")
+        mask[mask < 0.0] = 0
+        mask[mask >= 1.0] = 1
+    mask = torch.from_numpy(mask)
+
+    masked_image = image * (mask < 0.5) if discretize else image * (1 - mask)
+
+    return mask, masked_image
 
 
-def parse_args(input_args=None):
+# generate random masks
+def random_mask(im_shape, ratio=1, mask_full_image=False, mask_scale_min=1.0, mask_scale_max=1.0, mask_dropout_prob=0.25):
+    mask = Image.new("L", im_shape, 0)
+    if random.random() < mask_dropout_prob:
+        # print("mask dropout")
+        Image.new("L", im_shape, 255)
+        return mask
+    draw = ImageDraw.Draw(mask)
+    size = (random.randint(0, int(im_shape[0] * ratio)), random.randint(0, int(im_shape[1] * ratio)))
+    # use this to always mask the whole image
+    if mask_full_image:
+        size = (int(im_shape[0] * ratio), int(im_shape[1] * ratio))
+    limits = (im_shape[0] - size[0] // 2, im_shape[1] - size[1] // 2)
+    center = (random.randint(size[0] // 2, limits[0]), random.randint(size[1] // 2, limits[1]))
+    draw_type = random.randint(0, 1)
+    if draw_type == 0 or mask_full_image:
+        draw.rectangle(
+            (center[0] - size[0] // 2, center[1] - size[1] // 2, center[0] + size[0] // 2, center[1] + size[1] // 2),
+            fill=255,
+        )
+    else:
+        draw.ellipse(
+            (center[0] - size[0] // 2, center[1] - size[1] // 2, center[0] + size[0] // 2, center[1] + size[1] // 2),
+            fill=255,
+        )
+
+    mask_scale = random.uniform(mask_scale_min, mask_scale_max) if mask_scale_min != mask_scale_max else mask_scale_min
+    mask = ImageChops.multiply(mask, Image.new("L", im_shape, int(mask_scale * 255)))
+    return mask
+
+
+def parse_args():
     parser = argparse.ArgumentParser(description="Simple example of a training script.")
     parser.add_argument(
         "--pretrained_model_name_or_path",
@@ -62,20 +100,6 @@ def parse_args(input_args=None):
         default=None,
         required=True,
         help="Path to pretrained model or model identifier from huggingface.co/models.",
-    )
-    parser.add_argument(
-        "--pretrained_txt2img_model_name_or_path",
-        type=str,
-        default=None,
-        required=True,
-        help="Path to pretrained model or model identifier from huggingface.co/models. This model will be used to generate images from text, without depth conditioning, for generating sample images.",
-    )
-    parser.add_argument(
-        "--revision",
-        type=str,
-        default=None,
-        required=False,
-        help="Revision of pretrained model identifier from huggingface.co/models.",
     )
     parser.add_argument(
         "--tokenizer_name",
@@ -111,6 +135,42 @@ def parse_args(input_args=None):
         help="The probability of randomizing the instance prompt.",
     )
     parser.add_argument(
+        "--mask_scale_min",
+        default=1.0,
+        type=float,
+        help="The probability of randomizing the instance prompt.",
+    )
+    parser.add_argument(
+        "--mask_scale_max",
+        default=1.0,
+        type=float,
+        help="The probability of randomizing the instance prompt.",
+    )
+    parser.add_argument(
+        "--mask_dropout_prob",
+        default=0.25,
+        type=float,
+        help="The probability of randomizing the using a blank mask."
+    )
+    parser.add_argument(
+        "--class_mask_scale_min",
+        default=1.0,
+        type=float,
+        help="The probability of randomizing the instance prompt for the class images.",
+    )
+    parser.add_argument(
+        "--class_mask_scale_max",
+        default=1.0,
+        type=float,
+        help="The probability of randomizing the instance prompt for the class images.",
+    )
+    parser.add_argument(
+        "--class_mask_dropout_prob",
+        default=0.25,
+        type=float,
+        help="The probability of randomizing the using a blank mask for the class images."
+    )
+    parser.add_argument(
         "--instance_prompt_sep_token",
         type=str,
         default=", ",
@@ -128,14 +188,23 @@ def parse_args(input_args=None):
         action="store_true",
         help="Flag to add prior preservation loss.",
     )
+    parser.add_argument(
+        "--use_custom_instance_mask",
+        default=False,
+        action="store_true",
+        help="Flag to add custom mask images.",
+    )
+    parser.add_argument(
+        "--discretize_mask", action="store_true", help="Whether or not discretize mask (make all values 0 or 1)."
+    )
     parser.add_argument("--prior_loss_weight", type=float, default=1.0, help="The weight of prior preservation loss.")
     parser.add_argument(
         "--num_class_images",
         type=int,
         default=100,
         help=(
-            "Minimal class images for prior preservation loss. If there are not enough images already present in"
-            " class_data_dir, additional images will be sampled with class_prompt."
+            "Minimal class images for prior preservation loss. If not have enough images, additional images will be"
+            " sampled with class_prompt."
         ),
     )
     parser.add_argument(
@@ -170,24 +239,6 @@ def parse_args(input_args=None):
         type=int,
         default=None,
         help="Total number of training steps to perform.  If provided, overrides num_train_epochs.",
-    )
-    parser.add_argument(
-        "--checkpointing_steps",
-        type=int,
-        default=500,
-        help=(
-            "Save a checkpoint of the training state every X updates. These checkpoints are only suitable for resuming"
-            " training using `--resume_from_checkpoint`."
-        ),
-    )
-    parser.add_argument(
-        "--resume_from_checkpoint",
-        type=str,
-        default=None,
-        help=(
-            "Whether training should be resumed from a previous checkpoint. Use a path saved by"
-            ' `--checkpointing_steps`, or `"latest"` to automatically select the last available checkpoint.'
-        ),
     )
     parser.add_argument(
         "--gradient_accumulation_steps",
@@ -252,12 +303,32 @@ def parse_args(input_args=None):
     parser.add_argument(
         "--mixed_precision",
         type=str,
-        default=None,
+        default="no",
         choices=["no", "fp16", "bf16"],
         help=(
-            "Whether to use mixed precision. Choose between fp16 and bf16 (bfloat16). Bf16 requires PyTorch >="
-            " 1.10.and an Nvidia Ampere GPU.  Default to the value of accelerate config of the current system or the"
-            " flag passed with the `accelerate.launch` command. Use this argument to override the accelerate config."
+            "Whether to use mixed precision. Choose"
+            "between fp16 and bf16 (bfloat16). Bf16 requires PyTorch >= 1.10."
+            "and an Nvidia Ampere GPU."
+        ),
+    )
+    parser.add_argument("--local_rank", type=int, default=-1, help="For distributed training: local_rank")
+    parser.add_argument(
+        "--checkpointing_steps",
+        type=int,
+        default=500,
+        help=(
+            "Save a checkpoint of the training state every X updates. These checkpoints can be used both as final"
+            " checkpoints in case they are better than the last checkpoint and are suitable for resuming training"
+            " using `--resume_from_checkpoint`."
+        ),
+    )
+    parser.add_argument(
+        "--resume_from_checkpoint",
+        type=str,
+        default=None,
+        help=(
+            "Whether training should be resumed from a previous checkpoint. Use a path saved by"
+            ' `--checkpointing_steps`, or `"latest"` to automatically select the last available checkpoint.'
         ),
     )
     parser.add_argument("--local_rank", type=int, default=-1, help="For distributed training: local_rank")
@@ -267,33 +338,24 @@ def parse_args(input_args=None):
     parser.add_argument("--prefetch_factor", type=int, default=2, help="Number of batches to prefetch.")
     parser.add_argument("--drop_incomplete_batches", action="store_true", help="Whether or not to drop incomplete batches. (May help stabilize gradient)")
 
-    if input_args is not None:
-        args = parser.parse_args(input_args)
-    else:
-        args = parser.parse_args()
-
+    args = parser.parse_args()
     env_local_rank = int(os.environ.get("LOCAL_RANK", -1))
     if env_local_rank != -1 and env_local_rank != args.local_rank:
         args.local_rank = env_local_rank
+
+    if args.instance_data_dir is None:
+        raise ValueError("You must specify a train data directory.")
 
     if args.with_prior_preservation:
         if args.class_data_dir is None:
             raise ValueError("You must specify a data directory for class images.")
         if args.class_prompt is None:
             raise ValueError("You must specify prompt for class images.")
-    else:
-        # logger is not available yet
-        if args.class_data_dir is not None:
-            warnings.warn("You need not use --class_data_dir without --with_prior_preservation.")
-        if args.class_prompt is not None:
-            warnings.warn("You need not use --class_prompt without --with_prior_preservation.")
 
     return args
 
-def get_depth_image_path(normal_image_path):
-    return normal_image_path.parent / f"{normal_image_path.stem}_depth.png"
 
-class DreamBoothDepthDataset(Dataset):
+class DreamBoothInpaintDataset(Dataset):
     """
     A dataset to prepare the instance and class images with the prompts for fine-tuning the model.
     It pre-processes the images and the tokenizes prompts.
@@ -304,136 +366,128 @@ class DreamBoothDepthDataset(Dataset):
         instance_data_root,
         instance_prompt,
         tokenizer,
-        vae_scale_factor,
         class_data_root=None,
         class_prompt=None,
         size=512,
         instance_prompt_shuffle_prob=0.0,
         instance_prompt_sep_token=", ",
-        center_crop=False
+        use_custom_instance_mask=False,
+        center_crop=False,
+        discretize=True,
+        ratio=1.0,
+        class_ratio=1.0,
+        mask_full_image=False,
+        mask_scale_min=1.0,
+        mask_scale_max=1.0,
+        class_mask_scale_min=1.0,
+        class_mask_scale_max=1.0,
+        mask_dropout_prob=0.0,
+        class_mask_dropout_prob=0.0,
     ):
         self.size = size
         self.center_crop = center_crop
         self.tokenizer = tokenizer
-        self.vae_scale_factor = vae_scale_factor
 
         self.instance_data_root = Path(instance_data_root)
         if not self.instance_data_root.exists():
             raise ValueError("Instance images root doesn't exists.")
 
-        self.instance_images_path = list(filter(lambda path: str(path).find("_depth.") == -1, self.instance_data_root.iterdir()))
+        self.instance_images_path = list(Path(instance_data_root).iterdir())
         self.num_instance_images = len(self.instance_images_path)
         self.instance_prompt = instance_prompt
         self._length = self.num_instance_images
         self.instance_prompt_shuffle_prob = instance_prompt_shuffle_prob
         self.instance_prompt_sep_token = instance_prompt_sep_token
+        self.use_custom_instance_mask = use_custom_instance_mask
+        self.discretize = discretize
+        self.ratio = ratio
+        self.class_ratio = class_ratio
+        self.mask_full_image = mask_full_image
+        self.mask_scale_min = mask_scale_min
+        self.mask_scale_max = mask_scale_max
+        self.class_mask_scale_min = class_mask_scale_min
+        self.class_mask_scale_max = class_mask_scale_max
+        self.mask_dropout_prob = mask_dropout_prob
+        self.class_mask_dropout_prob = class_mask_dropout_prob
 
         if class_data_root is not None:
             self.class_data_root = Path(class_data_root)
             self.class_data_root.mkdir(parents=True, exist_ok=True)
-            self.class_images_path = list(filter(lambda path: str(path).find("_depth.") == -1, self.class_data_root.iterdir()))
+            self.class_images_path = list(self.class_data_root.iterdir())
             self.num_class_images = len(self.class_images_path)
             self._length = max(self.num_class_images, self.num_instance_images)
             self.class_prompt = class_prompt
         else:
             self.class_data_root = None
 
-        self.image_transforms = transforms.Compose(
+        self.image_transforms_resize_and_crop = transforms.Compose(
             [
                 transforms.Resize(size, interpolation=transforms.InterpolationMode.BILINEAR),
                 transforms.CenterCrop(size) if center_crop else transforms.RandomCrop(size),
+            ]
+        )
+
+        self.image_transforms = transforms.Compose(
+            [
                 transforms.ToTensor(),
                 transforms.Normalize([0.5], [0.5]),
             ]
         )
 
-        self.depth_image_transforms = transforms.Compose(
-            [
-                transforms.Resize(size // self.vae_scale_factor, interpolation=transforms.InterpolationMode.BILINEAR),
-                transforms.Grayscale(num_output_channels=1),
-                transforms.ToTensor()
-            ]
-        )
     def __len__(self):
         return self._length
 
     def __getitem__(self, index):
         example = {}
         instance_image_path = self.instance_images_path[index % self.num_instance_images]
-        if self.instance_prompt in ["", None]:
-            # if not using a static prompt use the image name as prompt
-            instance_prompt = re.sub(r'\..*$', '', instance_image_path.name)
-            instance_prompt = re.sub(r'_\d+', '', instance_prompt) # remove the number at the end of the image name for duplicate images
-            if random.random() < self.instance_prompt_shuffle_prob:
-                # shuffle the prompt after splitting by the separator token if the probability condition is met
-                instance_prompt = self.instance_prompt_sep_token.join(random.sample(instance_prompt.split(self.instance_prompt_sep_token), len(instance_prompt.split(self.instance_prompt_sep_token))))
-        else:
-            instance_prompt = self.instance_prompt
-        
-
-        instance_depth_image_path = get_depth_image_path(instance_image_path)
         instance_image = Image.open(instance_image_path)
-        instance_depth_image = Image.open(instance_depth_image_path)
         if not instance_image.mode == "RGB":
             instance_image = instance_image.convert("RGB")
+        instance_image = self.image_transforms_resize_and_crop(instance_image)
+        if self.instance_prompt in ["", None]:
+            instance_prompt = re.sub(r'\..*$', '', instance_image_path.name)
+            instance_prompt = re.sub(r'_\d+', '', instance_prompt) # remove _1, _2, etc. for duplicate images
+            if random.random() < self.instance_prompt_shuffle_prob:
+                instance_prompt = self.instance_prompt_sep_token.join(random.sample(instance_prompt.split(self.instance_prompt_sep_token), len(instance_prompt.split(self.instance_prompt_sep_token))))
+
+        if self.use_custom_instance_mask:
+            mask = Image.open(instance_image_path.parent / (instance_image_path.stem + "_mask.png"))
+            if not mask.mode == "L":
+                mask = mask.convert("L")
+            mask = self.image_transforms_resize_and_crop(mask)
+        else:
+            # generate a random mask
+            mask = random_mask(instance_image.size, ratio=self.ratio, mask_full_image=self.mask_full_image, mask_scale_min=self.mask_scale_min, mask_scale_max=self.mask_scale_max, mask_dropout_prob=self.mask_dropout_prob)
+        # prepare mask and masked image
+        mask, masked_image = prepare_mask_and_masked_image(instance_image, mask, discretize=self.discretize)
+        example["masks"] = mask
+        example["masked_images"] = masked_image
         example["instance_images"] = self.image_transforms(instance_image)
-        example["instance_depth_images"] = self.depth_image_transforms(instance_depth_image)
         example["instance_prompt_ids"] = self.tokenizer(
             instance_prompt,
+            padding="do_not_pad",
             truncation=True,
-            padding="max_length",
             max_length=self.tokenizer.model_max_length,
-            return_tensors="pt",
         ).input_ids
 
         if self.class_data_root:
-            class_image_path = self.class_images_path[index % self.num_class_images]
-            class_depth_image_path = get_depth_image_path(class_image_path)
-            class_image = Image.open(class_image_path)
-            class_depth_image = Image.open(class_depth_image_path)
+            class_image = Image.open(self.class_images_path[index % self.num_class_images])
             if not class_image.mode == "RGB":
                 class_image = class_image.convert("RGB")
+            class_image = self.image_transforms_resize_and_crop(class_image)
+            class_mask = random_mask(class_image.size, ratio=self.class_ratio, mask_full_image=self.mask_full_image, mask_scale_min=self.class_mask_scale_min, mask_scale_max=self.class_mask_scale_max, mask_dropout_prob=self.class_mask_dropout_prob)
+            class_mask, class_masked_image = prepare_mask_and_masked_image(class_image, class_mask, self.class_discretize)
+            example["class_masks"] = class_mask
+            example["class_masked_images"] = class_masked_image
             example["class_images"] = self.image_transforms(class_image)
-            example["class_depth_images"] = self.depth_image_transforms(class_depth_image)
             example["class_prompt_ids"] = self.tokenizer(
                 self.class_prompt,
+                padding="do_not_pad",
                 truncation=True,
-                padding="max_length",
                 max_length=self.tokenizer.model_max_length,
-                return_tensors="pt",
             ).input_ids
 
         return example
-
-
-class Collater:
-    def __init__(self, with_prior_preservation=False):
-        self.with_prior_preservation = with_prior_preservation
-    def __call__(self, examples):
-        input_ids = [example["instance_prompt_ids"] for example in examples]
-        pixel_values = [example["instance_images"] for example in examples]
-        depth_values = [example["instance_depth_images"] for example in examples]
-
-        # Concat class and instance examples for prior preservation.
-        # We do this to avoid doing two forward passes.
-        if self.with_prior_preservation:
-            input_ids += [example["class_prompt_ids"] for example in examples]
-            pixel_values += [example["class_images"] for example in examples]
-            depth_values += [example["class_depth_images"] for example in examples]
-
-        pixel_values = torch.stack(pixel_values)
-        pixel_values = pixel_values.to(memory_format=torch.contiguous_format).float()
-
-        depth_values = torch.stack(depth_values)
-        depth_values = depth_values.to(memory_format=torch.contiguous_format).float()
-
-        input_ids = torch.cat(input_ids, dim=0)
-
-        return {
-            "input_ids": input_ids,
-            "pixel_values": pixel_values,
-            "depth_values": depth_values,
-        }
 
 
 class PromptDataset(Dataset):
@@ -442,7 +496,6 @@ class PromptDataset(Dataset):
     def __init__(self, prompt, num_samples):
         self.prompt = prompt
         self.num_samples = num_samples
-        print(f'Creating prompt dataset with prompt={prompt} and num_samples={num_samples}')
 
     def __len__(self):
         return self.num_samples
@@ -463,37 +516,41 @@ def get_full_repo_name(model_id: str, organization: Optional[str] = None, token:
     else:
         return f"{organization}/{model_id}"
 
-def create_depth_images(paths, pretrained_model_name_or_path, accelerator, unet, text_encoder):
-    pipeline = DiffusionPipeline.from_pretrained(
-            pretrained_model_name_or_path,
-            unet=accelerator.unwrap_model(unet),
-            text_encoder=accelerator.unwrap_model(text_encoder),
-            revision=args.revision,
-        )
-    pipeline.to("cuda")
-    for path in paths:
-        print(f"For each image in {path}, creating a depth image.")
-        path_iterator = Path(path).iterdir()
-        non_depth_image_files = list(filter(lambda path: str(path).find("_depth.") == -1, path_iterator))
-        for image_path in tqdm(non_depth_image_files):
-            depth_path = get_depth_image_path(image_path)
-            if depth_path.exists():
-                continue
-            image_instance = Image.open(image_path)
-            if not image_instance.mode == "RGB":
-                image_instance = image_instance.convert("RGB")
-            image_instance = pipeline.feature_extractor(image_instance, return_tensors="pt").pixel_values
-            image_instance = image_instance.to("cuda")
-            depth_map = pipeline.depth_estimator(image_instance).predicted_depth
-            depth_min = torch.amin(depth_map, dim=[0, 1, 2], keepdim=True)
-            depth_max = torch.amax(depth_map, dim=[0, 1, 2], keepdim=True)
-            depth_map = 2.0 * (depth_map - depth_min) / (depth_max - depth_min) - 1.0
-            depth_map = depth_map[0,:,:]
-            depth_map_image = transforms.ToPILImage()(depth_map)
-            depth_map_image.save(depth_path)
-    return 2 ** (len(pipeline.vae.config.block_out_channels) - 1)
 
-def main(args):
+class Collater:
+    def __init__(self, with_prior_preservation=False, tokenizer=None, mask_scale_min=1.0, mask_scale_max=1.0, mask_dropout_prob=0.25):
+        self.with_prior_preservation = with_prior_preservation
+        self.tokenizer = tokenizer
+        self.mask_scale_min = mask_scale_min
+        self.mask_scale_max = mask_scale_max
+        self.mask_dropout_prob = mask_dropout_prob
+
+    def __call__(self, examples):
+        input_ids = [example["instance_prompt_ids"] for example in examples]
+        pixel_values = [example["instance_images"] for example in examples]
+        masks = [example["masks"] for example in examples]
+        masked_images = [example["masked_images"] for example in examples]
+
+        # Concat class and instance examples for prior preservation.
+        # We do this to avoid doing two forward passes.
+        if self.with_prior_preservation:
+            input_ids += [example["class_prompt_ids"] for example in examples]
+            pixel_values += [example["class_images"] for example in examples]
+            masks += [example["class_masks"] for example in examples]
+            masked_images += [example["class_masked_images"] for example in examples]
+
+        pixel_values = torch.stack(pixel_values)
+        pixel_values = pixel_values.to(memory_format=torch.contiguous_format).float()
+
+        input_ids = self.tokenizer.pad({"input_ids": input_ids}, padding=True, return_tensors="pt").input_ids
+        masks = torch.stack(masks)
+        masked_images = torch.stack(masked_images)
+        batch = {"input_ids": input_ids, "pixel_values": pixel_values, "masks": masks, "masked_images": masked_images}
+        return batch
+
+
+def main():
+    args = parse_args()
     logging_dir = Path(args.output_dir, args.logging_dir)
 
     accelerator = Accelerator(
@@ -554,6 +611,10 @@ def main(args):
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
 
+            del pipeline
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+
     # Handle the repository creation
     if accelerator.is_main_process:
         if args.push_to_hub:
@@ -573,39 +634,15 @@ def main(args):
 
     # Load the tokenizer
     if args.tokenizer_name:
-        tokenizer = AutoTokenizer.from_pretrained(
-            args.tokenizer_name,
-            revision=args.revision,
-            use_fast=False,
-        )
+        tokenizer = CLIPTokenizer.from_pretrained(args.tokenizer_name)
     elif args.pretrained_model_name_or_path:
-        tokenizer = AutoTokenizer.from_pretrained(
-            args.pretrained_model_name_or_path,
-            subfolder="tokenizer",
-            revision=args.revision,
-            use_fast=False,
-        )
-
-    # import correct text encoder class
-    text_encoder_cls = import_model_class_from_model_name_or_path(args.pretrained_model_name_or_path, args.revision)
+        tokenizer = CLIPTokenizer.from_pretrained(args.pretrained_model_name_or_path, subfolder="tokenizer")
 
     # Load models and create wrapper for stable diffusion
-    text_encoder = text_encoder_cls.from_pretrained(
-        args.pretrained_model_name_or_path,
-        subfolder="text_encoder",
-        revision=args.revision,
-    )
-    vae = AutoencoderKL.from_pretrained(
-        args.pretrained_model_name_or_path,
-        subfolder="vae",
-        revision=args.revision,
-    )
-    unet = UNet2DConditionModel.from_pretrained(
-        args.pretrained_model_name_or_path,
-        subfolder="unet",
-        revision=args.revision,
-    )
-    
+    text_encoder = CLIPTextModel.from_pretrained(args.pretrained_model_name_or_path, subfolder="text_encoder")
+    vae = AutoencoderKL.from_pretrained(args.pretrained_model_name_or_path, subfolder="vae")
+    unet = UNet2DConditionModel.from_pretrained(args.pretrained_model_name_or_path, subfolder="unet")
+
     if is_xformers_available():
         try:
             unet.enable_xformers_memory_efficient_attention()
@@ -655,21 +692,27 @@ def main(args):
 
     noise_scheduler = DDPMScheduler.from_pretrained(args.pretrained_model_name_or_path, subfolder="scheduler")
 
-    vae_scale_factor = create_depth_images([args.instance_data_dir, args.class_data_dir], args.pretrained_model_name_or_path, accelerator, unet, text_encoder)
-    train_dataset = DreamBoothDepthDataset(
+    train_dataset = DreamBoothInpaintDataset(
         instance_data_root=args.instance_data_dir,
         instance_prompt=args.instance_prompt,
-        tokenizer=tokenizer,
-        vae_scale_factor=vae_scale_factor,
         class_data_root=args.class_data_dir if args.with_prior_preservation else None,
         class_prompt=args.class_prompt,
+        tokenizer=tokenizer,
         size=args.resolution,
         instance_prompt_shuffle_prob=args.instance_prompt_shuffle_prob,
         instance_prompt_sep_token=args.instance_prompt_sep_token,
+        use_custom_instance_mask=args.use_custom_instance_mask,
         center_crop=args.center_crop,
+        discretize=args.discretize,
+        mask_scale_min=args.mask_scale_min,
+        mask_scale_max=args.mask_scale_max,
+        mask_dropout_prob=args.mask_dropout_prob,
+        class_mask_scale_min=args.class_mask_scale_min,
+        class_mask_scale_max=args.class_mask_scale_max,
+        class_mask_dropout_prob=args.class_mask_dropout_prob,
     )
 
-    collater = Collater(args.with_prior_preservation)
+    collater = Collater(args.with_prior_preservation, tokenizer, mask_scale_min=args.mask_scale_min, mask_scale_max=args.mask_scale_max, mask_dropout_prob=args.mask_dropout_prob)
     train_dataloader = torch.utils.data.DataLoader(
         train_dataset,
         batch_size=args.train_batch_size,
@@ -707,9 +750,9 @@ def main(args):
     accelerator.register_for_checkpointing(lr_scheduler)
 
     weight_dtype = torch.float32
-    if accelerator.mixed_precision == "fp16":
+    if args.mixed_precision == "fp16":
         weight_dtype = torch.float16
-    elif accelerator.mixed_precision == "bf16":
+    elif args.mixed_precision == "bf16":
         weight_dtype = torch.bfloat16
 
     # Move text_encode and vae to gpu.
@@ -768,8 +811,6 @@ def main(args):
 
     for epoch in range(first_epoch, args.num_train_epochs):
         unet.train()
-        if args.train_text_encoder:
-            text_encoder.train()
         for step, batch in enumerate(train_dataloader):
             # Skip steps until we reach the resumed step
             if args.resume_from_checkpoint and epoch == first_epoch and step < resume_step:
@@ -779,8 +820,25 @@ def main(args):
 
             with accelerator.accumulate(unet):
                 # Convert images to latent space
+
                 latents = vae.encode(batch["pixel_values"].to(dtype=weight_dtype)).latent_dist.sample()
                 latents = latents * 0.18215
+
+                # Convert masked images to latent space
+                masked_latents = vae.encode(
+                    batch["masked_images"].reshape(batch["pixel_values"].shape).to(dtype=weight_dtype)
+                ).latent_dist.sample()
+                masked_latents = masked_latents * 0.18215
+
+                masks = batch["masks"]
+                # resize the mask to latents shape as we concatenate the mask to the latents
+                mask = torch.stack(
+                    [
+                        torch.nn.functional.interpolate(mask, size=(args.resolution // 8, args.resolution // 8))
+                        for mask in masks
+                    ]
+                )
+                mask = mask.reshape(-1, 1, args.resolution // 8, args.resolution // 8)
 
                 # Sample noise that we'll add to the latents
                 noise = torch.randn_like(latents)
@@ -792,15 +850,15 @@ def main(args):
                 # Add noise to the latents according to the noise magnitude at each timestep
                 # (this is the forward diffusion process)
                 noisy_latents = noise_scheduler.add_noise(latents, noise, timesteps)
-                
-                # Concatenate the depth values to the latents
-                noisy_latents = torch.cat([noisy_latents, batch["depth_values"]], dim=1)
+
+                # concatenate the noised latents with the mask and the masked latents
+                latent_model_input = torch.cat([noisy_latents, mask, masked_latents], dim=1)
 
                 # Get the text embedding for conditioning
                 encoder_hidden_states = text_encoder(batch["input_ids"])[0]
 
                 # Predict the noise residual
-                model_pred = unet(noisy_latents, timesteps, encoder_hidden_states).sample
+                noise_pred = unet(latent_model_input, timesteps, encoder_hidden_states).sample
 
                 # Get the target for loss depending on the prediction type
                 if noise_scheduler.config.prediction_type == "epsilon":
@@ -811,20 +869,20 @@ def main(args):
                     raise ValueError(f"Unknown prediction type {noise_scheduler.config.prediction_type}")
 
                 if args.with_prior_preservation:
-                    # Chunk the noise and model_pred into two parts and compute the loss on each part separately.
-                    model_pred, model_pred_prior = torch.chunk(model_pred, 2, dim=0)
+                    # Chunk the noise and noise_pred into two parts and compute the loss on each part separately.
+                    noise_pred, noise_pred_prior = torch.chunk(noise_pred, 2, dim=0)
                     target, target_prior = torch.chunk(target, 2, dim=0)
 
                     # Compute instance loss
-                    loss = F.mse_loss(model_pred.float(), target.float(), reduction="none").mean([1, 2, 3]).mean()
+                    loss = F.mse_loss(noise_pred.float(), target.float(), reduction="none").mean([1, 2, 3]).mean()
 
                     # Compute prior loss
-                    prior_loss = F.mse_loss(model_pred_prior.float(), target_prior.float(), reduction="mean")
+                    prior_loss = F.mse_loss(noise_pred_prior.float(), target_prior.float(), reduction="mean")
 
                     # Add the prior loss to the instance loss.
                     loss = loss + args.prior_loss_weight * prior_loss
                 else:
-                    loss = F.mse_loss(model_pred.float(), target.float(), reduction="mean")
+                    loss = F.mse_loss(noise_pred.float(), target.float(), reduction="mean")
 
                 accelerator.backward(loss)
                 if accelerator.sync_gradients:
@@ -864,7 +922,6 @@ def main(args):
             args.pretrained_model_name_or_path,
             unet=accelerator.unwrap_model(unet),
             text_encoder=accelerator.unwrap_model(text_encoder),
-            revision=args.revision,
         )
         pipeline.save_pretrained(args.output_dir)
 
@@ -875,5 +932,4 @@ def main(args):
 
 
 if __name__ == "__main__":
-    args = parse_args()
-    main(args)
+    main()
