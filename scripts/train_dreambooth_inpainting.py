@@ -108,6 +108,16 @@ def parse_args():
         help="Path to pretrained model or model identifier from huggingface.co/models. Used for generating class images when using with_prior_preservation.",
     )
     parser.add_argument(
+        "--revision",
+        type=str,
+        default=None,
+        required=False,
+        help=(
+            "Revision of pretrained model identifier from huggingface.co/models. Trainable model components should be"
+            " float32 precision."
+        ),
+    )
+    parser.add_argument(
         "--tokenizer_name",
         type=str,
         default=None,
