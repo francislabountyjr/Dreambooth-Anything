@@ -203,6 +203,9 @@ def parse_args():
     parser.add_argument(
         "--discretize_mask", action="store_true", help="Whether or not discretize mask (make all values 0 or 1)."
     )
+    parser.add_argument(
+        "--discretize_class_mask", action="store_true", help="Whether or not discretize masks of class images (make all values 0 or 1)."
+    )
     parser.add_argument("--prior_loss_weight", type=float, default=1.0, help="The weight of prior preservation loss.")
     parser.add_argument(
         "--num_class_images",
@@ -379,6 +382,7 @@ class DreamBoothInpaintDataset(Dataset):
         use_custom_instance_mask=False,
         center_crop=False,
         discretize=True,
+        class_discretize=True,
         ratio=1.0,
         class_ratio=1.0,
         mask_full_image=False,
@@ -405,6 +409,7 @@ class DreamBoothInpaintDataset(Dataset):
         self.instance_prompt_sep_token = instance_prompt_sep_token
         self.use_custom_instance_mask = use_custom_instance_mask
         self.discretize = discretize
+        self.class_discretize = class_discretize
         self.ratio = ratio
         self.class_ratio = class_ratio
         self.mask_full_image = mask_full_image
@@ -709,6 +714,7 @@ def main():
         use_custom_instance_mask=args.use_custom_instance_mask,
         center_crop=args.center_crop,
         discretize=args.discretize_mask,
+        class_discretize=args.discretize_class_mask,
         mask_scale_min=args.mask_scale_min,
         mask_scale_max=args.mask_scale_max,
         mask_dropout_prob=args.mask_dropout_prob,
