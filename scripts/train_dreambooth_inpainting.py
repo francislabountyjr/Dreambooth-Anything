@@ -102,6 +102,12 @@ def parse_args():
         help="Path to pretrained model or model identifier from huggingface.co/models.",
     )
     parser.add_argument(
+        "--pretrained_txt2img_model_name_or_path",
+        type=str,
+        default=None,
+        help="Path to pretrained model or model identifier from huggingface.co/models. Used for generating class images when using with_prior_preservation.",
+    )
+    parser.add_argument(
         "--tokenizer_name",
         type=str,
         default=None,
