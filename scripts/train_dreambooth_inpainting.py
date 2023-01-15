@@ -102,6 +102,12 @@ def parse_args():
         help="Path to pretrained model or model identifier from huggingface.co/models.",
     )
     parser.add_argument(
+        "--pretrained_txt2img_model_name_or_path",
+        type=str,
+        default=None,
+        help="Path to pretrained model or model identifier from huggingface.co/models. Used for generating class images when using with_prior_preservation.",
+    )
+    parser.add_argument(
         "--tokenizer_name",
         type=str,
         default=None,
@@ -702,7 +708,7 @@ def main():
         instance_prompt_sep_token=args.instance_prompt_sep_token,
         use_custom_instance_mask=args.use_custom_instance_mask,
         center_crop=args.center_crop,
-        discretize=args.discretize,
+        discretize=args.discretize_mask,
         mask_scale_min=args.mask_scale_min,
         mask_scale_max=args.mask_scale_max,
         mask_dropout_prob=args.mask_dropout_prob,
