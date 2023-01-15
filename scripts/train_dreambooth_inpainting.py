@@ -454,7 +454,8 @@ class DreamBoothInpaintDataset(Dataset):
         if not instance_image.mode == "RGB":
             instance_image = instance_image.convert("RGB")
         instance_image = self.image_transforms_resize_and_crop(instance_image)
-        if self.instance_prompt in ["", None]:
+        instance_prompt = self.instance_prompt
+        if instance_prompt in ["", None]:
             instance_prompt = re.sub(r'\..*$', '', instance_image_path.name)
             instance_prompt = re.sub(r'_\d+', '', instance_prompt) # remove _1, _2, etc. for duplicate images
             if random.random() < self.instance_prompt_shuffle_prob:
