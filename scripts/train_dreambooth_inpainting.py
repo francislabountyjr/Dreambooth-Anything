@@ -311,7 +311,6 @@ def parse_args():
             "and an Nvidia Ampere GPU."
         ),
     )
-    parser.add_argument("--local_rank", type=int, default=-1, help="For distributed training: local_rank")
     parser.add_argument(
         "--checkpointing_steps",
         type=int,
