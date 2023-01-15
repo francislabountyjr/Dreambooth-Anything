@@ -108,6 +108,16 @@ def parse_args():
         help="Path to pretrained model or model identifier from huggingface.co/models. Used for generating class images when using with_prior_preservation.",
     )
     parser.add_argument(
+        "--revision",
+        type=str,
+        default=None,
+        required=False,
+        help=(
+            "Revision of pretrained model identifier from huggingface.co/models. Trainable model components should be"
+            " float32 precision."
+        ),
+    )
+    parser.add_argument(
         "--tokenizer_name",
         type=str,
         default=None,
@@ -342,7 +352,7 @@ def parse_args():
     parser.add_argument("--local_rank", type=int, default=-1, help="For distributed training: local_rank")
     parser.add_argument("--num_workers", type=int, default=1, help="Number of processes to use for data loading.")
     parser.add_argument("--pin_memory", action="store_true", help="Whether or not to pin memory for data loading.")
-    parser.add_argument("--persistant_workers", action="store_true", help="Whether or not to use persistent workers.")
+    parser.add_argument("--persistent_workers", action="store_true", help="Whether or not to use persistent workers.")
     parser.add_argument("--prefetch_factor", type=int, default=2, help="Number of batches to prefetch.")
     parser.add_argument("--drop_incomplete_batches", action="store_true", help="Whether or not to drop incomplete batches. (May help stabilize gradient)")
 
@@ -454,7 +464,8 @@ class DreamBoothInpaintDataset(Dataset):
         if not instance_image.mode == "RGB":
             instance_image = instance_image.convert("RGB")
         instance_image = self.image_transforms_resize_and_crop(instance_image)
-        if self.instance_prompt in ["", None]:
+        instance_prompt = self.instance_prompt
+        if instance_prompt in ["", None]:
             instance_prompt = re.sub(r'\..*$', '', instance_image_path.name)
             instance_prompt = re.sub(r'_\d+', '', instance_prompt) # remove _1, _2, etc. for duplicate images
             if random.random() < self.instance_prompt_shuffle_prob:
@@ -621,10 +632,6 @@ def main():
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
 
-            del pipeline
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
-
     # Handle the repository creation
     if accelerator.is_main_process:
         if args.push_to_hub:
@@ -731,7 +738,7 @@ def main():
         collate_fn=collater,
         num_workers=args.num_workers,
         pin_memory=args.pin_memory,
-        persistant_workers=args.persistant_workers,
+        persistent_workers=args.persistent_workers,
         prefetch_factor=args.prefetch_factor,
         drop_last=args.drop_incomplete_batches,
     )
