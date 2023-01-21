@@ -29,3 +29,6 @@ This is a combination of a bunch of repos as well as my own code and edits on sc
 
 # Contact
 Reach out to labounty3d@gmail.com with any requests/questions/comments/suggestions/concerns
+
+# Other Training Repos
+If you're interested in training text-to-audio latent diffusion go check out https://github.com/serp-co/ai-text-to-audio-latent-diffusion
